@@ -1,0 +1,220 @@
+---
+title: "Monte Carlo Simulation for Real Estate Breakeven Risk"
+author: "Emil Woivalin"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+#Project Overview
+This project was developed as volunteer work for a real estate development company preparing an apartment building project.
+
+Before construction could begin, the development needed to reach a defined commercial breakeven threshold: 70% of the apartments had to be sold. If the required presales were not achieved by the planned construction-start deadline, the project could face delays or potentially fail to proceed as planned.
+
+Purpose: Develop a Monte Carlo simulation model that estimates the probability of reaching the required presales threshold by a given deadline based on sales estimations and other uncertain variables.The model incorporates uncertainty in sales performance, market conditions, sales momentum, and phased apartment releases. This allows the development team to evaluate the risk of missing the breakeven target under a range of possible future outcomes.
+
+The central question was therefore: **What is the probability that the development reaches 426 apartment sales before the construction-start deadline?**
+
+
+#Background information
+
+The project contains 608 apartments, and the commercial breakeven requirement corresponds to approximately 70% of total units, or 426 apartments sold.
+
+```{r breakeven}
+total_units <- 608
+breakeven_pct <- 0.70
+base_breakeven <- ceiling(total_units * breakeven_pct)
+
+base_breakeven
+```
+
+
+#Approach
+
+The analysis uses a Monte Carlo simulation to generate many possible future sales paths. Each simulation represents one possible development of apartment sales over time. The model randomly varies key drivers within predefined assumptions and records the month in which the 426-unit breakeven threshold is reached. By repeating the process many times, the distribution of outcomes can be used to estimate:
+
+- the probability of reaching breakeven by a specific deadline,
+- the expected timing of breakeven,
+- downside risk and sensitivity to commercial and macroeconomic assumptions.
+
+
+#Model Inputs
+
+For the original implementation, key commercial assumptions were stored in Google Sheets so that they could be updated by company employees without editing the R code. The public portfolio version does not include the original spreadsheet URL or confidential business assumptions.
+
+```{r input-example, eval=FALSE}
+# Example only
+inputs <- read_sheet(
+  "GOOGLE_SHEET_URL",
+  sheet = "Inputs"
+)
+
+sales_velocity_commercial_plan <- read_sheet(
+  "GOOGLE_SHEET_URL",
+  sheet = "Sales Velocity"
+)
+```
+
+The model uses the following main categories of inputs:
+
+1. Apartment inventory
+2. Breakeven threshold
+3. Planned monthly sales velocity
+4. Uncertainty around the commercial plan
+5. Macroeconomic scenario probabilities
+6. Scenario-specific sales multipliers
+7. Sales momentum
+8. Phased inventory-release rules
+
+
+#Apartment Inventory
+
+The development contains 608 apartments divided into several commercial groups.
+
+```{r inventory}
+total_units      <- 608
+nucleo_units     <- 374
+reserva_units    <- 85
+vip_units        <- 54
+ff_premium_units <- 57
+socios_units     <- 38
+
+phase_inventory <- tibble::tribble(
+  ~phase,           ~cap,
+  "H0_nucleo",       374,
+  "H1_reserva",       85,
+  "H2_vip",           54,
+  "H2_ffpremium",     57
+)
+
+phase_inventory
+```
+
+Not all apartments are assumed to be available for sale immediately. Additional inventory is released once defined sales triggers are reached.
+
+#Phased Release Logic
+
+The model reflects the commercial launch structure by controlling when additional units become available.
+
+```{r release-triggers}
+h1_trigger <- ceiling(0.40 * 374)
+h2_trigger <- 350
+```
+
+The initial phase is available immediately. Additional inventory becomes available after cumulative sales pass specified thresholds. This prevents the simulation from assuming that all inventory is simultaneously available from the beginning.
+
+
+#Modeling Monthly Sales
+
+Monthly sales are modeled as a random count variable. The commercial sales plan specifies a monthly expected sales level and standard deviation for different periods of the project. A negative binomial distribution is used to represent variability around expected monthly apartment sales. This allows monthly sales to vary around the commercial plan instead of assuming a fixed number of sales every month.
+
+```{r negative-binomial-example, eval=FALSE}
+potential_sales <- rnbinom(
+  1,
+  mu   = adjusted_mu,
+  size = dispersion
+)
+```
+
+
+#Sources of Uncertainty
+
+##Commercial Plan Uncertainty
+
+Each simulated path receives a random factor around the base commercial sales plan.
+
+```{r plan-uncertainty-example, eval=FALSE}
+plan_factor <- runif(
+  1,
+  min = 1 - plan_uncertainty_pct,
+  max = 1 + plan_uncertainty_pct
+)
+```
+
+##Macroeconomic Scenarios
+
+Each simulation is assigned one macroeconomic environment: Weak, Base or Strong. Each scenario has a probability of occurring and a sales multiplier affecting expected sales.
+
+```{r macro-example, eval=FALSE}
+macro_state <- sample(
+  names(macro_probs),
+  size = 1,
+  prob = macro_probs
+)
+
+macro_factor <- macro_factors[macro_state]
+```
+
+##Sales Momentum
+
+The model also incorporates short-term sales momentum. If sales in the previous month outperform expectations, the expected sales rate in the following month can increase. If the previous month underperforms, expected sales may weaken.
+
+```{r momentum-example, eval=FALSE}
+previous_performance <-
+  previous_sales / previous_expected
+
+momentum_factor <-
+  1 +
+  momentum_strength *
+  (previous_performance - 1)
+```
+
+
+#Simulating One Sales Path
+
+For each month, the model identifies the relevant sales-velocity assumption, applies commercial-plan uncertainty, applies the macroeconomic scenario, adjusts for sales momentum, draws potential sales from the negative binomial distribution, checks which inventory phases have been released, limits sales to available inventory and updates cumulative apartment sales.
+
+A single simulated path therefore represents one plausible future sales trajectory.
+
+
+#Monte Carlo Simulation
+
+The single-path simulation is repeated many times.
+
+```{r mc-example, eval=FALSE}
+n_sims <- 200
+
+simulations <- replicate(
+  n_sims,
+  simulate_one_path(...),
+  simplify = FALSE
+)
+```
+
+For every simulated path, the model identifies the first month in which cumulative apartment sales reach the breakeven requirement.
+
+```{r threshold-example, eval=FALSE}
+hit <- which(simulated_path >= base_breakeven)
+
+month_reached <-
+  if (length(hit) == 0) {
+    NA_integer_
+  } else {
+    min(hit)
+  }
+```
+
+The original working model used 200 simulations during development. For a production-style risk estimate, the number of simulations are increased substantially to improve the stability of the estimated probabilities.
+
+
+#Risk Measures
+
+The model estimates the probability of reaching breakeven by different possible construction-start deadlines. The original implementation calculates the probability of breakeven by months 14–18 and reports the median breakeven month for each macroeconomic scenario. 
+
+
+#Google Sheets Integration
+
+The simulation was connected to Google Sheets to create a practical interface between the analytical model and business assumptions. The workflow was designed so that assumptions such as sales velocity, uncertainty, macroeconomic probabilities, macroeconomic sales factors, and momentum strength could be modified in the spreadsheet. The R model then reads these assumptions, runs the Monte Carlo simulation, and writes summarized results back to Google Sheets.
+
+
+#Technical Tools Used
+
+- R – used to build the simulation model, process inputs, run repeated sales scenarios, and summarize results.
+- Google Sheets – used as the business-facing interface for assumptions, sales velocity inputs, and model outputs.
+
+
+#Reproducibility
+
+The complete simulation logic can be reproduced in R, but the original Google Sheets workbook is not included in the public portfolio because it contains project-specific commercial assumptions and information provided by the real estate development company. To reproduce the model independently, recreate the required input tables and then connect those inputs to the R script.
