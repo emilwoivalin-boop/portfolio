@@ -1,0 +1,368 @@
+---
+title: "Lifeguard Shift Scheduling Optimization"
+author: "Emil Woivalin"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+#Project Overview
+The City of Espoo employs lifeguards across multiple public beaches during the summer season. Creating the shift schedule manually required substantial administrative work while also making it difficult to take into account individual shift preferences fairly.
+
+Purpose: To build an optimization model that could automatically allocate shifts based on employee preferences while ensuring fair workload distribution and staffing requirements.The model was implemented during my employment at the City of Espoo as Operations Coordinator. 
+
+---
+
+#Starting point
+
+The scheduling process have several simultaneous requirements:
+
+- Every shift need to have the required number of lifeguards.
+- Employees can work at most one shift per day.
+- Weekly workload limits have to be respected.
+- Some employees are unavailable on certain dates.
+- Shift preferences should be considered.
+- The overall distribution of shift preference outcomes should remain reasonably fair across employees.
+
+These requirements make manual scheduling difficult with a high number of employees.
+
+The problem is therefore a mixed-integer optimization problem, where the model selects the combination of employee-shift-date assignments that best satisfies both operational and employee-level objectives.
+
+The optimization model was built in R using the `ompr` modeling framework and solved with the GLPK mixed-integer programming solver.
+
+---
+
+#Tools
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(ompr)
+library(ompr.roi)
+library(ROI.plugin.glpk)
+library(writexl)
+```
+
+
+#Data Inputs
+The model uses four main input tables:
+
+1. Preferences – employee-specific scores for different shift types.
+2. Requirements – the number of lifeguards required for each shift.
+3. Shift Days – the dates included in the scheduling period.
+4. Away – employee availability restrictions.
+
+In the original implementation these inputs were maintained in an Excel workbook, allowing the schedule inputs to be updated without modifying the optimization code.
+
+```{r data-input-example, eval=FALSE}
+file <- "ScheduleModel.xlsx"
+
+prefs        <- read_excel(file, sheet = "Preferences", skip = 1)
+requirements <- read_excel(file, sheet = "Requirements")
+shift_days   <- read_excel(file, sheet = "ShiftDays")
+away_sheet   <- read_excel(file, sheet = "Away")
+```
+
+---
+
+#Data Preparation
+Employee preferences are transformed from a Excel spreadsheet into a matrix that can be used directly by the optimization model.
+
+```{r data-preparation, eval=FALSE}
+prefs_long <- prefs %>%
+  pivot_longer(
+    -Employee,
+    names_to = "Shift",
+    values_to = "Score"
+  )
+
+employee_ids <- unique(prefs_long$Employee)
+shift_ids    <- unique(prefs_long$Shift)
+date_ids     <- sort(unique(shift_days$Date))
+
+n_emp    <- length(employee_ids)
+n_shifts <- length(shift_ids)
+n_days   <- length(date_ids)
+
+Score_mat <- prefs_long %>%
+  pivot_wider(
+    names_from = Shift,
+    values_from = Score,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Employee") %>%
+  as.matrix()
+```
+
+The preference matrix provides the model with a numerical cost for assigning each employee to each shift type.
+
+---
+
+#Optimization Model
+
+The core decision variable is:
+
+\[
+x_{ijk} =
+\begin{cases}
+1 & \text{if employee } i \text{ is assigned to shift } j \text{ on day } k \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+```{r decision-variable, eval=FALSE}
+m <- MIPModel() %>%
+  add_variable(
+    x[i, j, k],
+    i = 1:n_emp,
+    j = 1:n_shifts,
+    k = 1:n_days,
+    type = "binary"
+  )
+```
+
+This creates one binary decision for every possible employee-shift-date combination.
+
+---
+
+#Operational Constraints
+
+##Required Staffing
+
+Every shift must contain exactly the required number of lifeguards.
+
+```{r staffing-constraint, eval=FALSE}
+m <- m %>%
+  add_constraint(
+    sum_expr(x[i, j, k], i = 1:n_emp) == needed[j],
+    j = 1:n_shifts,
+    k = 1:n_days
+  )
+```
+
+---
+
+##Maximum One Shift per Day
+
+A lifeguard can work at most one shift on a given day.
+
+```{r daily-constraint, eval=FALSE}
+m <- m %>%
+  add_constraint(
+    sum_expr(x[i, j, k], j = 1:n_shifts) <= 1,
+    i = 1:n_emp,
+    k = 1:n_days
+  )
+```
+
+---
+
+##Weekly Workload Limits
+
+Weekly shift limits are included to prevent excessive workload.
+
+```{r weekly-cap, eval=FALSE}
+week_caps <- setNames(rep(5, length(week_list)), names(week_list))
+week_caps["28"] <- 6
+
+for (wk in names(week_list)) {
+
+  k_idxs <- week_list[[wk]]
+  cap <- week_caps[wk]
+
+  m <- m %>%
+    add_constraint(
+      sum_expr(
+        x[i, j, k],
+        j = 1:n_shifts,
+        k = k_idxs
+      ) <= cap,
+      i = 1:n_emp
+    )
+}
+```
+
+The standard weekly limit was five shifts, with an explicitly defined exception for one week where six shifts were permitted due to understaffing.
+
+---
+
+##Employee Availability
+
+Unavailable employees are excluded from assignments using hard constraints. This ensures that the optimizer cannot assign an employee on a day when they have reported being unavailable.
+
+```{r away-constraints, eval=FALSE}
+away_long <- away_sheet %>%
+  pivot_longer(
+    -Date,
+    names_to = "Employee",
+    values_to = "Flag"
+  ) %>%
+  filter(!is.na(Flag) & Flag != "") %>%
+  transmute(
+    i = match(Employee, employee_ids),
+    k = match(as.Date(Date), date_ids)
+  ) %>%
+  filter(!is.na(i) & !is.na(k))
+
+for (row in seq_len(nrow(away_long))) {
+
+  i_idx <- away_long$i[row]
+  k_idx <- away_long$k[row]
+
+  m <- m %>%
+    add_constraint(
+      sum_expr(x[i_idx, j, k_idx], j = 1:n_shifts) == 0
+    )
+}
+```
+
+---
+
+#Preference-Based Scheduling
+
+Employee shift preferences are incorporated into the optimization objective.
+
+```{r preference-score, eval=FALSE}
+sum_expr(
+  Score_mat[i, j] * x[i, j, k],
+  i = 1:n_emp,
+  j = 1:n_shifts,
+  k = 1:n_days
+)
+```
+
+The model minimizes the total preference score associated with the generated schedule. As a result, assignments with better preference scores are favored when operational constraints allow. This allows employee preferences to influence scheduling without overriding critical staffing and availability requirements.
+
+---
+
+#Fairness Extension
+
+Optimizing only the total preference score could produce a schedule that is efficient overall while assigning relatively undesirable shifts disproportionately to certain employees. To address this, a fairness component was added. For each employee, the model calculates their total preference cost:
+
+\[
+TotalScore_i =
+\sum_{j,k} Score_{ij}x_{ijk}
+\]
+
+A variable \( \alpha \) is then used to limit the preference cost relative to the employee's expected number of shifts. 
+
+```{r fairness, eval=FALSE}
+m <- m %>%
+  add_variable(total_score[i], i = 1:n_emp, lb = 0) %>%
+  add_variable(alpha_var, lb = 0) %>%
+
+  add_constraint(
+    total_score[i] ==
+      sum_expr(
+        Score_mat[i, j] * x[i, j, k],
+        j = 1:n_shifts,
+        k = 1:n_days
+      ),
+    i = 1:n_emp
+  ) %>%
+
+  add_constraint(
+    total_score[i] <= alpha_var * q_i[i],
+    i = idx_keep
+  )
+```
+
+Certain employees could however be excluded from this fairness constraint where operational circumstances required different treatment.
+
+---
+
+#Two-Stage Optimization
+
+The scheduling process uses two optimization phases.
+
+##Phase 1 Maximize Fairness
+
+The first optimization minimizes the fairness variable \( \alpha \).
+
+```{r phase-one, eval=FALSE}
+m1 <- m %>%
+  set_objective(alpha_var, "min")
+
+result1 <- solve_model(
+  m1,
+  with_ROI(
+    solver = "glpk",
+    control = list(tm_limit = 600000)
+  )
+)
+
+best_alpha <- result1$solution$objval
+```
+
+This identifies the best achievable fairness level while satisfying the scheduling constraints.
+
+## Phase 2 Optimize Preferences
+
+The second phase fixes fairness close to the best value found in Phase 1 and then minimizes the total employee preference cost. This creates a lexicographic optimization process, where the model finds the fairest feasible schedule and among schedules with approximately the same fairness level, it choses the one that best satisfies employee preferences.
+
+```{r phase-two, eval=FALSE}
+m2 <- m %>%
+  add_constraint(alpha_var <= best_alpha + 1e-6) %>%
+  set_objective(
+    sum_expr(
+      Score_mat[i, j] * x[i, j, k],
+      i = 1:n_emp,
+      j = 1:n_shifts,
+      k = 1:n_days
+    ),
+    "min"
+  )
+
+result <- solve_model(
+  m2,
+  with_ROI(solver = "glpk")
+)
+```
+
+
+---
+
+#Schedule Output
+
+Once the optimization has been solved, the selected assignments are converted back into a normal schedule.
+
+```{r output, eval=FALSE}
+sol_df <- get_solution(result, x[i, j, k]) %>%
+  filter(value > 0.5)
+
+schedule <- sol_df %>%
+  transmute(
+    Employee = employee_ids[i],
+    Shift    = shift_ids[j],
+    Date     = date_ids[k]
+  ) %>%
+  arrange(Date, Shift, Employee)
+```
+
+The final schedule can then be exported directly to Excel.
+
+```{r export, eval=FALSE}
+write_xlsx(
+  schedule,
+  "optimized_shift_schedule.xlsx"
+)
+```
+
+---
+
+**Technical Tools used**
+
+- R — used to build the scheduling model, process the data, and automate the optimization workflow.
+- GLPK — used as the optimization solver to find the best feasible shift allocation.
+- Excel input/output — used for storing inputs and exporting the final optimized schedule.
+- `readxl`
+- `writexl`
+
+
+#Reproductibility
+
+To reproduce the analysis, the input Excel workbook should contain the same four sheets used by the model: Preferences, Requirements, ShiftDays, and Away. To run the model with new data, update the Excel input file path and ensure that the input sheets follow the same structure as the original workbook.
+
+Because the original workbook contains employee-specific scheduling information, it is not included in the public portfolio repository. The R code nevertheless shows the complete optimization workflow, including data preparation, constraint construction, fairness optimization, schedule generation, and Excel export.
